@@ -29,7 +29,10 @@
 // native call. Other records are read field by field: unquoted fields jump
 // between delimiters with indexOf, quoted fields jump straight to their
 // closing quote, and field results pass through closure variables instead of
-// a fresh result array per field.
+// a fresh result array per field. Unquoted fields also reuse the record's
+// cached next-newline position instead of rescanning for it per field
+// (readUnquoted only ever runs outside quotes, so that newline is always
+// the record end; a quoted field's embedded newlines refresh the cache).
 
 const COMMA = 0;
 const LINE_BREAK = 1;
@@ -60,6 +63,13 @@ export function run(input) {
   let fe = END;
   let fa = 0;
 
+  // nl: index of the next LF at or after pos, or len when none. Set at each
+  // record start and refreshed inside readUnquoted whenever pos has moved
+  // past it (a quoted field with an embedded LF does that). readUnquoted is
+  // only ever entered outside quotes, so the next LF from pos is always the
+  // record end, and caching it saves one native scan per unquoted field.
+  let nl = -1;
+
   // Reads unquoted characters onto `value` up to the next comma or line
   // break: a CR not followed by LF is dropped (stray_cr). Sets fv, fe, fa.
   function readUnquoted(value) {
@@ -67,12 +77,15 @@ export function run(input) {
     // Cheap lane: the field's raw text up to the next comma or LF holds no
     // CR but for the CR of a closing CRLF, so it is kept whole.
     {
+      if (pos >= nl) {
+        nl = text.indexOf('\n', pos);
+        if (nl === -1) nl = len;
+      }
       const ci = text.indexOf(',', pos);
-      const ni = text.indexOf('\n', pos);
       let end, term;
-      if (ci === -1 && ni === -1) { end = len; term = END; }
-      else if (ni === -1 || (ci !== -1 && ci < ni)) { end = ci; term = COMMA; }
-      else { end = ni; term = LINE_BREAK; }
+      if (ci !== -1 && ci < nl) { end = ci; term = COMMA; }
+      else if (nl < len) { end = nl; term = LINE_BREAK; }
+      else { end = len; term = END; }
       const seg = text.slice(pos, end);
       const ri = seg.indexOf('\r');
       if (ri === -1) {
@@ -264,6 +277,7 @@ export function run(input) {
     // the line itself, so the quote/CR check never scans past the line.
     const lineEnd = text.indexOf('\n', pos);
     const eol = lineEnd === -1 ? len : lineEnd;
+    nl = eol;
     let segEnd = eol;
     if (lineEnd !== -1 && segEnd > pos && text.charCodeAt(segEnd - 1) === 13) segEnd -= 1; // CRLF
     if (segEnd > pos) {
