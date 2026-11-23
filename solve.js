@@ -23,11 +23,13 @@
 //     the header).
 //
 // Speed: csv-reader walks one character at a time and builds every field by
-// concatenation. This parser instead jumps with indexOf / a delimiter regex
-// and slices whole fields at once. A record whose line holds no quote and no
-// stray CR (the large majority) is split in one native call; only records
-// that hold a quote or a stray CR take the field-by-field path, and quoted
-// fields jump straight to their closing quote with indexOf.
+// concatenation. This parser jumps with indexOf and slices whole fields at
+// once. A record whose line holds no quote and no stray CR (checked on the
+// line's own slice, so the check never scans past the line) is split in one
+// native call. Other records are read field by field: unquoted fields jump
+// between delimiters with indexOf, quoted fields jump straight to their
+// closing quote, and field results pass through closure variables instead of
+// a fresh result array per field.
 
 const COMMA = 0;
 const LINE_BREAK = 1;
@@ -43,8 +45,6 @@ export function run(input) {
   let width = -1;
 
   const len = text.length;
-  const delim = /[,\r\n]/g; // the characters that can end an unquoted field
-  const crlf = /\r\n?/g; // CRLF or a lone CR inside quotes, each one LF
 
   let pos = 0; // the next character to read
   let line = 1; // the line that character is on
@@ -54,92 +54,133 @@ export function run(input) {
   let recordLine = 1;
   let recordRow = null;
 
-  // The raw slice [start, end) of a quoted field's content, with every CRLF or
-  // lone CR in it read as LF. Returns [value, lineBreaks].
-  function quotedSegment(start, end) {
-    const s = text.slice(start, end);
-    if (s.indexOf('\r') === -1) {
-      let n = s.indexOf('\n');
-      if (n === -1) return [s, 0];
-      let breaks = 1;
-      while ((n = s.indexOf('\n', n + 1)) !== -1) breaks++;
-      return [s, breaks];
-    }
-    const t = s.replace(crlf, '\n');
-    let n = t.indexOf('\n');
-    let breaks = 0;
-    while (n !== -1) {
-      breaks++;
-      n = t.indexOf('\n', n + 1);
-    }
-    return [t, breaks];
-  }
+  // The field just read: its value, how it ended, how many characters the
+  // last unquoted read kept (quote_junk fires only when it kept some).
+  let fv = '';
+  let fe = END;
+  let fa = 0;
 
-  // Reads unquoted characters onto `value` up to the next comma or line break:
-  // a CR not followed by LF is dropped (stray_cr). Returns [value, ended, added],
-  // `added` counting the characters kept after `value`.
+  // Reads unquoted characters onto `value` up to the next comma or line
+  // break: a CR not followed by LF is dropped (stray_cr). Sets fv, fe, fa.
   function readUnquoted(value) {
-    let added = 0;
+    fa = 0;
+    // Cheap lane: the field's raw text up to the next comma or LF holds no
+    // CR but for the CR of a closing CRLF, so it is kept whole.
+    {
+      const ci = text.indexOf(',', pos);
+      const ni = text.indexOf('\n', pos);
+      let end, term;
+      if (ci === -1 && ni === -1) { end = len; term = END; }
+      else if (ni === -1 || (ci !== -1 && ci < ni)) { end = ci; term = COMMA; }
+      else { end = ni; term = LINE_BREAK; }
+      const seg = text.slice(pos, end);
+      const ri = seg.indexOf('\r');
+      if (ri === -1) {
+        fv = value ? value + seg : seg;
+        fa = seg.length;
+        pos = term === END ? len : end + 1;
+        if (term === LINE_BREAK) line += 1;
+        fe = term;
+        return;
+      }
+      if (term === LINE_BREAK && ri === seg.length - 1) {
+        const s = seg.slice(0, -1);
+        fv = value ? value + s : s;
+        fa = s.length;
+        pos = end + 1;
+        line += 1;
+        fe = LINE_BREAK;
+        return;
+      }
+    }
     let start = pos;
     for (;;) {
-      delim.lastIndex = pos;
-      const m = delim.exec(text);
-      if (m === null) {
+      // The nearest of comma, LF, CR from pos.
+      let i = text.indexOf(',', pos);
+      let c = 44;
+      const n = text.indexOf('\n', pos);
+      if (n !== -1 && (i === -1 || n < i)) { i = n; c = 10; }
+      const r = text.indexOf('\r', pos);
+      if (r !== -1 && (i === -1 || r < i)) { i = r; c = 13; }
+      if (i === -1) {
         if (start < len) {
           const s = text.slice(start);
           value = value ? value + s : s;
-          added += s.length;
+          fa += len - start;
         }
         pos = len;
-        return [value, END, added];
+        fv = value; fe = END;
+        return;
       }
-      const i = m.index;
-      const c = text.charCodeAt(i);
       if (c === 44) {
-        // Comma: the field ends, the record goes on.
         if (start < i) {
           const s = text.slice(start, i);
           value = value ? value + s : s;
-          added += s.length;
+          fa += i - start;
         }
         pos = i + 1;
-        return [value, COMMA, added];
+        fv = value; fe = COMMA;
+        return;
       }
       if (c === 10) {
-        // LF: the field ends, the record ends.
         if (start < i) {
           const s = text.slice(start, i);
           value = value ? value + s : s;
-          added += s.length;
+          fa += i - start;
         }
         pos = i + 1;
         line += 1;
-        return [value, LINE_BREAK, added];
+        fv = value; fe = LINE_BREAK;
+        return;
       }
       // CR.
       if (i + 1 < len && text.charCodeAt(i + 1) === 10) {
         if (start < i) {
           const s = text.slice(start, i);
           value = value ? value + s : s;
-          added += s.length;
+          fa += i - start;
         }
         pos = i + 2;
         line += 1;
-        return [value, LINE_BREAK, added];
+        fv = value; fe = LINE_BREAK;
+        return;
       }
       // A CR not followed by LF is dropped (stray_cr).
       errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
       if (start < i) {
         const s = text.slice(start, i);
         value = value ? value + s : s;
-        added += s.length;
+        fa += i - start;
       }
       pos = i + 1;
       start = pos;
     }
   }
 
-  // Reads a quoted field whose opening quote is at pos.
+  // The raw slice [start, end) of a quoted field's content, with every CRLF
+  // or lone CR in it read as LF. Sets fv (the read text) and fa (its count
+  // of line breaks).
+  function quotedSegment(start, end) {
+    const s = text.slice(start, end);
+    if (s.indexOf('\r') === -1) {
+      let n = s.indexOf('\n');
+      if (n === -1) { fv = s; fa = 0; return; }
+      let breaks = 1;
+      while ((n = s.indexOf('\n', n + 1)) !== -1) breaks++;
+      fv = s; fa = breaks;
+      return;
+    }
+    const t = s.replace(/\r\n?/g, '\n');
+    let n = t.indexOf('\n');
+    let breaks = 0;
+    while (n !== -1) {
+      breaks++;
+      n = t.indexOf('\n', n + 1);
+    }
+    fv = t; fa = breaks;
+  }
+
+  // Reads a quoted field whose opening quote is at pos. Sets fv and fe.
   function readQuoted() {
     const open = pos;
     const openLine = line;
@@ -149,47 +190,51 @@ export function run(input) {
     for (;;) {
       const q = text.indexOf('"', start);
       if (q === -1) {
-        // The quote never closes: it is a literal character, and the text after
-        // it is read again as unquoted.
+        // The quote never closes: it is a literal character, and the text
+        // after it is read again as unquoted.
         pos = open + 1;
         line = openLine;
         errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
-        return readUnquoted('"');
+        readUnquoted('"');
+        return;
       }
       if (q + 1 < len && text.charCodeAt(q + 1) === 34) {
         // A doubled quote: one quote in the value, and the field goes on.
-        const seg = quotedSegment(start, q);
-        value = value ? value + seg[0] + '"' : seg[0] + '"';
-        lineDelta += seg[1];
+        quotedSegment(start, q);
+        value = value ? value + fv + '"' : fv + '"';
+        lineDelta += fa;
         start = q + 2;
         continue;
       }
       // The closing quote.
-      const seg = quotedSegment(start, q);
-      value = value ? value + seg[0] : seg[0];
-      line += lineDelta + seg[1];
+      quotedSegment(start, q);
+      value = value ? value + fv : fv;
+      line += lineDelta + fa;
       pos = q + 1;
-      if (pos >= len) return [value, END, 0];
+      if (pos >= len) { fv = value; fe = END; return; }
       const c = text.charCodeAt(pos);
       if (c === 44) {
         pos += 1;
-        return [value, COMMA, 0];
+        fv = value; fe = COMMA;
+        return;
       }
       if (c === 10) {
         pos += 1;
         line += 1;
-        return [value, LINE_BREAK, 0];
+        fv = value; fe = LINE_BREAK;
+        return;
       }
       if (c === 13 && pos + 1 < len && text.charCodeAt(pos + 1) === 10) {
         pos += 2;
         line += 1;
-        return [value, LINE_BREAK, 0];
+        fv = value; fe = LINE_BREAK;
+        return;
       }
       // What follows the closing quote is appended as it stands, up to the
       // next comma or line break.
-      const junk = readUnquoted(value);
-      if (junk[2] > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
-      return junk;
+      readUnquoted(value);
+      if (fa > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
+      return;
     }
   }
 
@@ -215,29 +260,27 @@ export function run(input) {
     let fields = null;
     let quoted = false;
     // Fast path: the whole line holds no quote and no stray CR, so it is one
-    // record of plain fields, split in a single native call.
+    // record of plain fields, split in a single native call. The slice is
+    // the line itself, so the quote/CR check never scans past the line.
     const lineEnd = text.indexOf('\n', pos);
     const eol = lineEnd === -1 ? len : lineEnd;
     let segEnd = eol;
     if (lineEnd !== -1 && segEnd > pos && text.charCodeAt(segEnd - 1) === 13) segEnd -= 1; // CRLF
     if (segEnd > pos) {
-      const q = text.indexOf('"', pos);
-      const r = text.indexOf('\r', pos);
-      if ((q === -1 || q >= segEnd) && (r === -1 || r >= segEnd)) {
-        fields = text.slice(pos, segEnd).split(',');
+      const seg = text.slice(pos, segEnd);
+      if (seg.indexOf('"') === -1 && seg.indexOf('\r') === -1) {
+        fields = seg.split(',');
         pos = lineEnd === -1 ? len : lineEnd + 1;
         if (lineEnd !== -1) line += 1;
       }
     }
     if (fields === null) {
       fields = [];
-      let ended;
       do {
         quoted = text.charCodeAt(pos) === 34;
-        const f = quoted ? readQuoted() : readUnquoted('');
-        fields.push(f[0]);
-        ended = f[1];
-      } while (ended === COMMA);
+        if (quoted) readQuoted(); else readUnquoted('');
+        fields.push(fv);
+      } while (fe === COMMA);
     }
 
     // A line that held only stray CRs is left with no characters: no record (its stray_cr errors stay).
